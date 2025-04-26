@@ -1,0 +1,151 @@
+import tensorflow as tf
+import os
+import requests
+from bs4 import BeautifulSoup
+from tensorflow.keras.applications.efficientnet import preprocess_input
+from tensorflow.keras.models import load_model
+
+# === Config ===
+MODEL_PATH = 'best_model.keras'  # Path to your pre-trained model
+IMG_SIZE = 128
+CONFIDENCE_THRESHOLD = 0.85
+CLASS_FOLDER = 'Coins_Mint'  # or 'Coins_Decade', depending on your model
+SCRAPE_URL_BASE = "https://www.usacoinbook.com/coins/"
+
+# Set up logging for debugging and monitoring
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# === Web Scraping Function ===
+def scrape_coin_info(coin_label):
+    """Scrape additional information about the coin from a website."""
+    try:
+        # Clean the coin label for URL (e.g., "1969 Penny" -> "1969-penny")
+        coin_query = coin_label.lower().replace(" ", "-")
+        url = f"{SCRAPE_URL_BASE}{coin_query}/"
+        logger.info(f"Scraping URL: {url}")
+
+        # Send HTTP request
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()  # Raise an error for bad status codes
+
+        # Parse the page with BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Example: Extract coin value or details (adjust selectors based on the website)
+        # On usacoinbook.com, coin values are often in a table or div with class 'coin-value'
+        value_section = soup.find('div', class_='coin-value')
+        if value_section:
+            value = value_section.text.strip()
+            logger.info(f"Found coin value for {coin_label}: {value}")
+            return {"value": value}
+        else:
+            logger.warning(f"No value found for {coin_label}")
+            return {"value": "Not found"}
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to scrape coin info for {coin_label}: {e}")
+        return {"value": "Error during scraping"}
+    except Exception as e:
+        logger.error(f"Unexpected error while scraping for {coin_label}: {e}")
+        return {"value": "Unexpected error"}
+
+# === Camera and Coin Detection Functions ===
+def preprocess_frame(frame, bbox):
+    """Preprocess the frame for model prediction."""
+    x, y, w, h = bbox
+    coin = frame[y:y+h, x:x+w]
+    coin = cv2.resize(coin, (IMG_SIZE, IMG_SIZE))
+    coin = cv2.cvtColor(coin, cv2.COLOR_BGR2RGB)
+    coin = preprocess_input(np.expand_dims(coin, axis=0))
+    return coin
+
+def run_coin_detection():
+    """Run the coin detection and classification process."""
+    # Load model and class labels
+    try:
+        model = load_model(MODEL_PATH)
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        return
+
+    try:
+        class_names = sorted(os.listdir(CLASS_FOLDER))
+    except FileNotFoundError:
+        logger.error(f"Could not find folder: {CLASS_FOLDER}")
+        class_names = [f"Class_{i}" for i in range(model.output_shape[1])]
+
+    logger.info(f"Loaded {len(class_names)} classes.")
+
+    # Initialize camera
+    cap = cv2.VideoCapture(1)  # Adjust the camera index if needed
+    if not cap.isOpened():
+        logger.error("Failed to open camera")
+        return
+
+    logger.info("Camera running. Press 'q' to quit.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            logger.warning("Failed to capture frame")
+            break
+
+        display = frame.copy()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blur, 50, 150)
+
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        coin_detected = False
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 2000 < area < 20000:  # Adjust depending on coin size
+                x, y, w, h = cv2.boundingRect(cnt)
+                coin_img = preprocess_frame(frame, (x, y, w, h))
+                preds = model.predict(coin_img)
+                prob = float(np.max(preds))
+                idx = int(np.argmax(preds))
+
+                label = class_names[idx] if idx < len(class_names) else "Unknown"
+
+                if prob > CONFIDENCE_THRESHOLD:
+                    coin_detected = True
+                    cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cv2.putText(display, f"{label} ({prob:.2f})", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    # Scrape additional info about the coin
+                    coin_info = scrape_coin_info(label)
+                    logger.info(f"Scraped info for {label}: {coin_info}")
+
+                    # Display scraped info on the frame (e.g., coin value)
+                    cv2.putText(display, f"Value: {coin_info['value']}", (x, y + h + 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+                    # Placeholder: Send the image, prediction, and scraped info to the platform
+                    logger.info(f"Detected coin: {label} with confidence {prob:.2f}")
+
+        if not coin_detected:
+            cv2.putText(display, "Insert Coin...", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        cv2.imshow('Live Coin Sorter', display)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# === Main Function ===
+def main():
+    """Main function to run coin detection (Wi-Fi check skipped for Windows)."""
+    logger.info("Skipping Wi-Fi connection check (Windows environment)")
+    run_coin_detection()
+
+if __name__ == "__main__":
+    main()
